@@ -1,0 +1,7 @@
+gradio
+soundfile
+librosa
+scipy
+qwen-tts
+bitsandbytes
+accelerate
