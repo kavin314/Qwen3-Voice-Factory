@@ -22,6 +22,17 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*flash-attn.*")
 warnings.filterwarnings("ignore", message=".*SoX.*")
 
+# 2. Filter noisy print() output from third-party libs
+import builtins
+_orig_print = builtins.print
+_PRINT_BLOCKLIST = ("flash-attn", "flash_attn", "SoX", "sox")
+def _filtered_print(*args, **kwargs):
+    msg = " ".join(str(a) for a in args)
+    if any(kw in msg for kw in _PRINT_BLOCKLIST):
+        return
+    _orig_print(*args, **kwargs)
+builtins.print = _filtered_print
+
 # 2. Mute Loggers (show errors only)
 logging.getLogger("torchaudio").setLevel(logging.ERROR)
 logging.getLogger("qwen_tts").setLevel(logging.ERROR)
@@ -117,10 +128,15 @@ def load_specific_model(mode):
     print(f"⏳ Loading {mode}: {model_id}")
 
     try:
-        # 先嘗試 offline（SSL 憑證問題無法連 HuggingFace 時的備援）
+        # GTX 1060（Pascal, compute 6.1）對 Qwen3-TTS 各 dtype 都不穩定：
+        #   bfloat16 → cuBLAS Tensor Op 失敗（Pascal 沒 Tensor Core）
+        #   fp16     → 數值不穩定 → device-side assert
+        #   fp32 cuda→ illegal memory access（原因不明）
+        # 唯一穩定的方式是 CPU 推論。慢但可靠。
+        # 若您換成 RTX 系列顯卡，可改回 device_map="cuda" + dtype=torch.bfloat16。
         hf_kwargs = dict(
-            device_map="cuda",
-            dtype=torch.bfloat16,
+            device_map="cpu",
+            dtype=torch.float32,
             attn_implementation="eager",
             low_cpu_mem_usage=True,
             trust_remote_code=True,
@@ -146,10 +162,10 @@ def load_specific_model(mode):
 
 # --- ENGINE 1: DIRECTOR ---
 def run_director(text, speaker="Ryan", instruction=""):
-    if not text or len(text.strip()) == 0: return None, "⚠️ Please enter text first!", None
-    
+    if not text or len(text.strip()) == 0: return None, "⚠️ Please enter text first!"
+
     model = load_specific_model("director")
-    if not model: return None, "Load Error", None
+    if not model: return None, "Load Error"
     
     print(f"🎬 Director: '{text}' | Speaker: {speaker}")
     try:
@@ -159,96 +175,127 @@ def run_director(text, speaker="Ryan", instruction=""):
             instruct=instruction if instruction else None,
             language="Auto"
         )
-        audio_path = save_audio(wavs, sr, f"director_{speaker}")
-        return audio_path, "✅ Done", audio_path
+        return save_audio(wavs, sr, f"director_{speaker}"), "✅ Done"
     except Exception as e: return handle_error(e)
 
 # --- ENGINE 2: CLONER ---
+
+def _split_sentences(text, max_chars=40):
+    """依標點斷句，每段不超過 max_chars 字元。"""
+    import re
+    # 先依句末標點切分
+    parts = re.split(r'(?<=[。！？!?\.…])', text.strip())
+    chunks = []
+    current = ""
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if len(current) + len(part) <= max_chars:
+            current += part
+        else:
+            if current:
+                chunks.append(current)
+            # 單段超過 max_chars 時強制截斷
+            while len(part) > max_chars:
+                chunks.append(part[:max_chars])
+                part = part[max_chars:]
+            current = part
+    if current:
+        chunks.append(current)
+    return chunks if chunks else [text]
+
+def _clone_one(model, text, ref_wav, ref_sr, actual_ref_text, use_x_vector, instruct):
+    """對單一文字段落呼叫 generate_voice_clone，回傳 (wavs, sr)。"""
+    try:
+        return model.generate_voice_clone(
+            text=text,
+            ref_audio=(ref_wav, ref_sr),
+            ref_text=actual_ref_text,
+            x_vector_only_mode=use_x_vector,
+            language="Auto",
+            instruct=instruct,
+        )
+    except TypeError as te:
+        if "instruct" in str(te):
+            return model.generate_voice_clone(
+                text=text,
+                ref_audio=(ref_wav, ref_sr),
+                ref_text=actual_ref_text,
+                x_vector_only_mode=use_x_vector,
+                language="Auto",
+                prompt=instruct,
+            )
+        raise
+
 def run_cloner(text, ref_audio, ref_text="", style_instruction=""):
     # 0. 基本檢查
     if not ref_audio:
-        return None, "⚠️ No Audio provided!", None
+        return None, "⚠️ No Audio provided!"
     if not text or len(text.strip()) == 0:
-        return None, "⚠️ Please enter text first!", None
-    
+        return None, "⚠️ Please enter text first!"
+
     model = load_specific_model("cloner")
     if not model:
-        return None, "Load Error", None
-    
+        return None, "Load Error"
+
     # 1. Load Audio
     try:
         ref_wav, ref_sr = librosa.load(ref_audio, sr=16000, mono=True)
     except Exception as e:
         return None, f"⚠️ Error loading audio file: {e}", None
 
-    # 1.1 限制參考音檔長度（避免 Mimi encoder OOM / illegal memory access）
-    max_ref_seconds = 5.0  # GTX 1060 6GB 記憶體極度吃緊，降到 5s
+    # 1.1 限制參考音檔長度（GTX 1060 6GB 吃緊）
+    max_ref_seconds = 5.0
     max_len = int(max_ref_seconds * ref_sr)
     if len(ref_wav) > max_len:
         ref_wav = ref_wav[:max_len]
-    print(f"🧬 Cloning: '{text}' (ref {len(ref_wav)/ref_sr:.1f}s @ {ref_sr}Hz)")
 
-    # 2. 決定 clone 模式（有 transcript 時用 ICL，沒有用 X-vector）
+    # 2. 決定 clone 模式
+    if ref_text and len(ref_text.strip()) > 0:
+        print("👉 High-Quality Mode (ICL) with Transcript")
+        use_x_vector = False
+        actual_ref_text = ref_text
+    else:
+        print("👉 Fast Mode (X-Vector)")
+        use_x_vector = True
+        actual_ref_text = None
+
+    instruct = style_instruction.strip() if style_instruction and style_instruction.strip() else None
+
+    # 3. 長文自動分段（fp32 在 GTX 1060 6GB 下保留 KV cache 空間）
+    MAX_CHARS = 60
+    chunks = _split_sentences(text, max_chars=MAX_CHARS)
+    print(f"🧬 Cloning: {len(chunks)} chunk(s), ref {len(ref_wav)/ref_sr:.1f}s @ {ref_sr}Hz")
+
     try:
-        if ref_text and len(ref_text.strip()) > 0:
-            print(f"👉 High-Quality Mode (ICL) with Transcript")
-            use_x_vector = False
-            actual_ref_text = ref_text
-        else:
-            print("👉 Fast Mode (X-Vector)")
-            use_x_vector = True
-            actual_ref_text = None
-
-        # 3. 整理 style / instruction 字串
-        instruct = style_instruction.strip() if style_instruction and style_instruction.strip() else None
-
-        # 4. 調用 Qwen3-TTS clone
-        #   Qwen3-TTS-12Hz-1.7B-Base 的 generate_voice_clone 在新版 qwen-tts 會接受 instruct / prompt 類型參數。[web:194][web:153]
         t_start = time.time()
-        wavs, sr = model.generate_voice_clone(
-            text=text,
-            ref_audio=(ref_wav, ref_sr),
-            ref_text=actual_ref_text,
-            x_vector_only_mode=use_x_vector,
-            language="Auto",
-            instruct=instruct,   # 🔑 風格指令：說話方式、情緒、語速等
-        )
-        elapsed = time.time() - t_start
+        all_wavs = []
+        final_sr = None
+        for i, chunk in enumerate(chunks):
+            print(f"  [{i+1}/{len(chunks)}] '{chunk}'")
+            wavs, sr = _clone_one(model, chunk, ref_wav, ref_sr, actual_ref_text, use_x_vector, instruct)
+            # wavs 可能是 list、tensor 或 ndarray
+            w = wavs[0] if isinstance(wavs, (list, tuple)) else wavs
+            arr = w.squeeze().cpu().numpy() if hasattr(w, 'cpu') else np.squeeze(np.asarray(w))
+            all_wavs.append(arr)
+            final_sr = sr
+            torch.cuda.empty_cache()
 
-        torch.cuda.empty_cache()
-        return save_audio(wavs, sr, "clone"), f"✅ Done ({elapsed:.1f}s)"
-    except TypeError as te:
-        # 萬一你目前安裝的 qwen_tts 版本不吃 instruct，
-        # 退而求其次改用 prompt 參數再試一次。
-        if "instruct" in str(te):
-            try:
-                print("⚠️ 'instruct' not supported, falling back to 'prompt' parameter")
-                t_start = time.time()
-                wavs, sr = model.generate_voice_clone(
-                    text=text,
-                    ref_audio=(ref_wav, ref_sr),
-                    ref_text=actual_ref_text,
-                    x_vector_only_mode=use_x_vector,
-                    language="Auto",
-                    prompt=instruct,   # 部分版本用 prompt/風格提示
-                )
-                elapsed = time.time() - t_start
-                torch.cuda.empty_cache()
-                return save_audio(wavs, sr, "clone"), f"✅ Done ({elapsed:.1f}s)"
-            except Exception as e2:
-                return handle_error(e2)
-        return handle_error(te)
+        combined = np.concatenate(all_wavs) if len(all_wavs) > 1 else all_wavs[0]
+        elapsed = time.time() - t_start
+        return save_audio(combined, final_sr, "clone"), f"✅ Done ({elapsed:.1f}s, {len(chunks)} seg)"
     except Exception as e:
         return handle_error(e)
 
 
 # --- ENGINE 3: CREATOR ---
 def run_designer(text, voice_description, instruction=""):
-    if not text or len(text.strip()) == 0: return None, "⚠️ Please enter text first!", None
-    if not voice_description or len(voice_description.strip()) == 0: return None, "⚠️ Please describe the voice first!", None
-    
+    if not text or len(text.strip()) == 0: return None, "⚠️ Please enter text first!"
+    if not voice_description or len(voice_description.strip()) == 0: return None, "⚠️ Please describe the voice first!"
+
     model = load_specific_model("designer")
-    if not model: return None, "Load Error", None
+    if not model: return None, "Load Error"
     
     print(f"🎨 Design: '{text}'")
     try:
@@ -262,8 +309,7 @@ def run_designer(text, voice_description, instruction=""):
             instruct=final_instruct,
             language="Auto"
         )
-        audio_path = save_audio(wavs, sr, "design")
-        return audio_path, "✅ Done", audio_path
+        return save_audio(wavs, sr, "design"), "✅ Done"
     except Exception as e: return handle_error(e)
 
 # --- HELPERS ---
@@ -273,9 +319,13 @@ def save_audio(wavs, sr, prefix):
     filename = f"{prefix}_{timestamp}.wav"
     path = os.path.abspath(os.path.join(OUTPUT_DIR, filename))
     
-    if isinstance(wavs, list): data = wavs[0]
-    else: data = wavs
-    
+    if isinstance(wavs, list):
+        data = wavs[0]
+    elif hasattr(wavs, 'cpu'):
+        data = wavs.squeeze().cpu().numpy()
+    else:
+        data = np.squeeze(wavs)
+
     sf.write(path, data, sr)
     return path
 
@@ -294,9 +344,9 @@ def handle_error(e):
         current_loaded_mode = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return None, f"❌ CUDA 錯誤，已自動卸載模型。請再試一次（模型將重新載入）。\n{err_str}", None
+        return None, f"❌ CUDA 錯誤，已自動卸載模型。請再試一次（模型將重新載入）。\n{err_str}"
 
-    return None, f"❌ Error: {err_str}", None
+    return None, f"❌ Error: {err_str}"
 
 # --- GUI SETUP ---
 custom_css = """
@@ -426,4 +476,5 @@ if __name__ == "__main__":
     demo.launch( server_name="0.0.0.0",  # 對外 listen
         server_port=7880,
         inbrowser=False,
+        show_error=True,
         css=custom_css)
