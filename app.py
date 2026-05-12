@@ -3,6 +3,18 @@ import sys
 import warnings
 import logging
 
+# 跳過 SSL 憑證驗證（本機 CA 不在信任鏈時的常見問題）
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import requests
+import functools
+_orig_request = requests.Session.request
+@functools.wraps(_orig_request)
+def _no_verify_request(self, method, url, **kwargs):
+    kwargs.setdefault("verify", False)
+    return _orig_request(self, method, url, **kwargs)
+requests.Session.request = _no_verify_request
+
 # --- SILENCER BLOCK ---
 # 1. Suppress Python Warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -105,14 +117,22 @@ def load_specific_model(mode):
     print(f"⏳ Loading {mode}: {model_id}")
 
     try:
-        model = Qwen3TTSModel.from_pretrained(
-            model_id,
-            device_map="cuda",  # 繞過 accelerate offload hooks（Pascal 上不穩）
+        # 先嘗試 offline（SSL 憑證問題無法連 HuggingFace 時的備援）
+        hf_kwargs = dict(
+            device_map="cuda",
             dtype=torch.bfloat16,
             attn_implementation="eager",
             low_cpu_mem_usage=True,
-            trust_remote_code=True
+            trust_remote_code=True,
         )
+        try:
+            model = Qwen3TTSModel.from_pretrained(model_id, **hf_kwargs)
+        except Exception as net_err:
+            if "SSL" in str(net_err) or "certificate" in str(net_err) or "SSLError" in str(net_err):
+                print(f"⚠️ SSL error, retrying with local_files_only=True ...")
+                model = Qwen3TTSModel.from_pretrained(model_id, local_files_only=True, **hf_kwargs)
+            else:
+                raise
         torch.cuda.empty_cache()
         print(f"✅ {mode.upper()} loaded! VRAM: {torch.cuda.memory_allocated(0)/1e9:.1f}GB")
         loaded_models[mode] = model
@@ -139,7 +159,8 @@ def run_director(text, speaker="Ryan", instruction=""):
             instruct=instruction if instruction else None,
             language="Auto"
         )
-        return save_audio(wavs, sr, f"director_{speaker}"), "Done"
+        audio_path = save_audio(wavs, sr, f"director_{speaker}")
+        return audio_path, "✅ Done", audio_path
     except Exception as e: return handle_error(e)
 
 # --- ENGINE 2: CLONER ---
@@ -241,7 +262,8 @@ def run_designer(text, voice_description, instruction=""):
             instruct=final_instruct,
             language="Auto"
         )
-        return save_audio(wavs, sr, "design"), "Done"
+        audio_path = save_audio(wavs, sr, "design")
+        return audio_path, "✅ Done", audio_path
     except Exception as e: return handle_error(e)
 
 # --- HELPERS ---
@@ -258,10 +280,23 @@ def save_audio(wavs, sr, prefix):
     return path
 
 def handle_error(e):
-    print(f"❌ Error: {e}")
+    err_str = str(e)
+    print(f"❌ Error: {err_str}")
     import traceback
     traceback.print_exc()
-    return None, f"Error: {e}"
+
+    # CUDA illegal memory access 會汙染整個 context，必須卸載所有模型才能繼續使用
+    if "illegal memory access" in err_str or "CUDA error" in err_str:
+        print("⚠️ CUDA error detected — unloading all models to reset GPU context...")
+        global loaded_models, current_loaded_mode
+        for mode in list(loaded_models.keys()):
+            loaded_models[mode] = None
+        current_loaded_mode = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return None, f"❌ CUDA 錯誤，已自動卸載模型。請再試一次（模型將重新載入）。\n{err_str}", None
+
+    return None, f"❌ Error: {err_str}", None
 
 # --- GUI SETUP ---
 custom_css = """
