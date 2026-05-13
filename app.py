@@ -160,8 +160,13 @@ def load_specific_model(mode):
                 trust_remote_code=True,
             )
             model = _load_model(gpu_kwargs)
+            # speech_tokenizer（mimi codec）使用卷積，在 Pascal bfloat16 下會 illegal memory access
+            # 轉 float32 以穩定解碼；LM 本體保持 bfloat16 不變
+            st = getattr(model.model, "speech_tokenizer", None)
+            if st is not None:
+                st.float()
             vram = torch.cuda.memory_allocated(0) / 1e9
-            print(f"✅ {mode.upper()} loaded on GPU! VRAM: {vram:.2f}GB")
+            print(f"✅ {mode.upper()} loaded on GPU! VRAM: {vram:.2f}GB (LM=bf16, codec=fp32)")
         else:
             raise RuntimeError("no_cuda")
 
