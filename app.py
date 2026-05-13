@@ -151,7 +151,7 @@ def load_specific_model(mode):
             print(f"🚀 嘗試 GPU (bfloat16) 載入 {mode}…")
             gpu_kwargs = dict(
                 device_map="cuda",
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 attn_implementation="eager",
                 low_cpu_mem_usage=True,
                 trust_remote_code=True,
@@ -171,7 +171,7 @@ def load_specific_model(mode):
         try:
             cpu_kwargs = dict(
                 device_map="cpu",
-                torch_dtype=torch.float32,
+                dtype=torch.float32,
                 attn_implementation="eager",
                 low_cpu_mem_usage=True,
                 trust_remote_code=True,
