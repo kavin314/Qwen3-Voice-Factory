@@ -127,37 +127,60 @@ def load_specific_model(mode):
     model_id = MODELS_CONFIG[mode]
     print(f"⏳ Loading {mode}: {model_id}")
 
-    try:
-        # GTX 1060（Pascal, compute 6.1）對 Qwen3-TTS 各 dtype 都不穩定：
-        #   bfloat16 → cuBLAS Tensor Op 失敗（Pascal 沒 Tensor Core）
-        #   fp16     → 數值不穩定 → device-side assert
-        #   fp32 cuda→ illegal memory access（原因不明）
-        # 唯一穩定的方式是 CPU 推論。慢但可靠。
-        # 若您換成 RTX 系列顯卡，可改回 device_map="cuda" + dtype=torch.bfloat16。
-        hf_kwargs = dict(
-            device_map="cpu",
-            dtype=torch.float32,
-            attn_implementation="eager",
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        )
+    # 停用 bfloat16 Tensor Op（Pascal 沒有 Tensor Core，否則 cuBLAS 會 EXECUTION_FAILED）
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    torch.backends.cudnn.allow_tf32 = False
+
+    use_gpu = torch.cuda.is_available()
+
+    def _load_model(hf_kwargs):
         try:
-            model = Qwen3TTSModel.from_pretrained(model_id, **hf_kwargs)
+            return Qwen3TTSModel.from_pretrained(model_id, **hf_kwargs)
         except Exception as net_err:
             if "SSL" in str(net_err) or "certificate" in str(net_err) or "SSLError" in str(net_err):
                 print(f"⚠️ SSL error, retrying with local_files_only=True ...")
-                model = Qwen3TTSModel.from_pretrained(model_id, local_files_only=True, **hf_kwargs)
-            else:
-                raise
-        torch.cuda.empty_cache()
-        print(f"✅ {mode.upper()} loaded! VRAM: {torch.cuda.memory_allocated(0)/1e9:.1f}GB")
-        loaded_models[mode] = model
-        current_loaded_mode = mode
-        return model
+                return Qwen3TTSModel.from_pretrained(model_id, local_files_only=True, **hf_kwargs)
+            raise
 
-    except Exception as e:
-        print(f"❌ {mode} Error: {e}")
-        return None
+    try:
+        if use_gpu:
+            print(f"🚀 嘗試 GPU (bfloat16) 載入 {mode}…")
+            gpu_kwargs = dict(
+                device_map="cuda",
+                torch_dtype=torch.bfloat16,
+                attn_implementation="eager",
+                low_cpu_mem_usage=True,
+                trust_remote_code=True,
+            )
+            model = _load_model(gpu_kwargs)
+            vram = torch.cuda.memory_allocated(0) / 1e9
+            print(f"✅ {mode.upper()} loaded on GPU! VRAM: {vram:.2f}GB")
+        else:
+            raise RuntimeError("no_cuda")
+
+    except Exception as gpu_err:
+        err_msg = str(gpu_err)
+        if "no_cuda" not in err_msg:
+            print(f"⚠️ GPU 載入失敗 ({err_msg[:80]})，退回 CPU fp32…")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        try:
+            cpu_kwargs = dict(
+                device_map="cpu",
+                torch_dtype=torch.float32,
+                attn_implementation="eager",
+                low_cpu_mem_usage=True,
+                trust_remote_code=True,
+            )
+            model = _load_model(cpu_kwargs)
+            print(f"✅ {mode.upper()} loaded on CPU (fp32).")
+        except Exception as e:
+            print(f"❌ {mode} 載入失敗: {e}")
+            return None
+
+    loaded_models[mode] = model
+    current_loaded_mode = mode
+    return model
 
 
 # --- ENGINE 1: DIRECTOR ---
