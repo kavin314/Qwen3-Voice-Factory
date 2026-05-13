@@ -26,6 +26,7 @@ if not exist "python_env\python.exe" (
     pause
     exit
 )
+set PYTHONIOENCODING=utf-8
 set GRADIO_MCP_SERVER=True
 set CUDA_LAUNCH_BLOCKING=1
 :: 停用 bfloat16 Tensor Op 精度縮減（Pascal 沒有 Tensor Core，啟用時會 CUBLAS_STATUS_EXECUTION_FAILED）

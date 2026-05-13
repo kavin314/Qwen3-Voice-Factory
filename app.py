@@ -30,7 +30,11 @@ def _filtered_print(*args, **kwargs):
     msg = " ".join(str(a) for a in args)
     if any(kw in msg for kw in _PRINT_BLOCKLIST):
         return
-    _orig_print(*args, **kwargs)
+    try:
+        _orig_print(*args, **kwargs)
+    except UnicodeEncodeError:
+        safe = msg.encode("ascii", errors="replace").decode("ascii")
+        _orig_print(safe, **{k: v for k, v in kwargs.items() if k != "end"})
 builtins.print = _filtered_print
 
 # 2. Mute Loggers (show errors only)
