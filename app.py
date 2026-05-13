@@ -160,16 +160,16 @@ def load_specific_model(mode):
                 trust_remote_code=True,
             )
             model = _load_model(gpu_kwargs)
-            # speech_tokenizer（mimi codec）使用卷積，在 Pascal bfloat16 下會 illegal memory access
-            # 轉 float32 以穩定解碼；LM 本體保持 bfloat16 不變
-            # speech_tokenizer 是 Python wrapper，實際 nn.Module 在 .model 屬性
+            # speech_tokenizer（mimi codec）的 conv_transpose1d 在 Pascal bfloat16 下
+            # 找不到 cuDNN engine（Pascal 不支援 bfloat16 conv）。
+            # 解法：把 codec 移到 CPU float32 執行，LM 仍在 GPU bfloat16（快）。
+            # decode() 內部會用 self.device 把 codes 移到正確 device，所以只需更新 device 即可。
             st = getattr(model.model, "speech_tokenizer", None)
             if st is not None:
                 nn_model = getattr(st, "model", None)
-                if nn_model is not None and hasattr(nn_model, "float"):
-                    nn_model.float()
-                elif hasattr(st, "float"):
-                    st.float()
+                if nn_model is not None:
+                    nn_model.float().cpu()
+                    st.device = torch.device("cpu")
             vram = torch.cuda.memory_allocated(0) / 1e9
             print(f"✅ {mode.upper()} loaded on GPU! VRAM: {vram:.2f}GB (LM=bf16, codec=fp32)")
         else:
