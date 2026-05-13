@@ -118,8 +118,11 @@ def unload_other_models(keep_mode):
             print(f"🗑️ Unloading {mode} to free VRAM...")
             del loaded_models[mode]
             loaded_models[mode] = None
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 def load_specific_model(mode):
     global loaded_models, current_loaded_mode
@@ -166,8 +169,11 @@ def load_specific_model(mode):
         err_msg = str(gpu_err)
         if "no_cuda" not in err_msg:
             print(f"⚠️ GPU 載入失敗 ({err_msg[:80]})，退回 CPU fp32…")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
         try:
             cpu_kwargs = dict(
                 device_map="cpu",
@@ -307,7 +313,10 @@ def run_cloner(text, ref_audio, ref_text="", style_instruction=""):
             arr = w.squeeze().cpu().numpy() if hasattr(w, 'cpu') else np.squeeze(np.asarray(w))
             all_wavs.append(arr)
             final_sr = sr
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
         combined = np.concatenate(all_wavs) if len(all_wavs) > 1 else all_wavs[0]
         elapsed = time.time() - t_start
@@ -369,8 +378,11 @@ def handle_error(e):
         for mode in list(loaded_models.keys()):
             loaded_models[mode] = None
         current_loaded_mode = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass  # context already corrupted — ignore cleanup errors
         return None, f"❌ CUDA 錯誤，已自動卸載模型。請再試一次（模型將重新載入）。\n{err_str}"
 
     return None, f"❌ Error: {err_str}"
